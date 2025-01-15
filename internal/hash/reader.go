@@ -19,6 +19,7 @@ package hash
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -71,13 +72,14 @@ type Options struct {
 	Size       int64
 	ActualSize int64
 	DisableMD5 bool
+	ForceMD5   []byte
 }
 
 // NewReaderWithOpts is like NewReader but takes `Options` as argument, allowing
 // callers to indicate if they want to disable md5sum checksum.
-func NewReaderWithOpts(src io.Reader, opts Options) (*Reader, error) {
+func NewReaderWithOpts(ctx context.Context, src io.Reader, opts Options) (*Reader, error) {
 	// return hard limited reader
-	return newReader(src, opts.Size, opts.MD5Hex, opts.SHA256Hex, opts.ActualSize, opts.DisableMD5)
+	return newReader(ctx, src, opts.Size, opts.MD5Hex, opts.SHA256Hex, opts.ActualSize, opts.DisableMD5, opts.ForceMD5)
 }
 
 // NewReader returns a new Reader that wraps src and computes
@@ -95,11 +97,11 @@ func NewReaderWithOpts(src io.Reader, opts Options) (*Reader, error) {
 // checksums multiple times.
 // NewReader enforces S3 compatibility strictly by ensuring caller
 // does not send more content than specified size.
-func NewReader(src io.Reader, size int64, md5Hex, sha256Hex string, actualSize int64) (*Reader, error) {
-	return newReader(src, size, md5Hex, sha256Hex, actualSize, false)
+func NewReader(ctx context.Context, src io.Reader, size int64, md5Hex, sha256Hex string, actualSize int64) (*Reader, error) {
+	return newReader(ctx, src, size, md5Hex, sha256Hex, actualSize, false, nil)
 }
 
-func newReader(src io.Reader, size int64, md5Hex, sha256Hex string, actualSize int64, disableMD5 bool) (*Reader, error) {
+func newReader(ctx context.Context, src io.Reader, size int64, md5Hex, sha256Hex string, actualSize int64, disableMD5 bool, forceMD5 []byte) (*Reader, error) {
 	MD5, err := hex.DecodeString(md5Hex)
 	if err != nil {
 		return nil, BadDigest{ // TODO(aead): Return an error that indicates that an invalid ETag has been specified
@@ -153,7 +155,7 @@ func newReader(src io.Reader, size int64, md5Hex, sha256Hex string, actualSize i
 		r := ioutil.HardLimitReader(src, size)
 		if !disableMD5 {
 			if _, ok := src.(etag.Tagger); !ok {
-				src = etag.NewReader(r, MD5)
+				src = etag.NewReader(ctx, r, MD5, forceMD5)
 			} else {
 				src = etag.Wrap(r, src)
 			}
@@ -162,7 +164,7 @@ func newReader(src io.Reader, size int64, md5Hex, sha256Hex string, actualSize i
 		}
 	} else if _, ok := src.(etag.Tagger); !ok {
 		if !disableMD5 {
-			src = etag.NewReader(src, MD5)
+			src = etag.NewReader(ctx, src, MD5, forceMD5)
 		}
 	}
 	var h hash.Hash
@@ -253,6 +255,26 @@ func (r *Reader) Read(p []byte) (int, error) {
 	}
 	if r.contentHasher != nil {
 		r.contentHasher.Write(p[:n])
+	}
+
+	// If we have reached our expected size,
+	// do one more read to ensure we are at EOF
+	// and that any trailers have been read.
+	attempts := 0
+	for err == nil && r.size >= 0 && r.bytesRead >= r.size {
+		attempts++
+		if r.bytesRead > r.size {
+			return 0, SizeTooLarge{Want: r.size, Got: r.bytesRead}
+		}
+		var tmp [1]byte
+		var n2 int
+		n2, err = r.src.Read(tmp[:])
+		if n2 > 0 {
+			return 0, SizeTooLarge{Want: r.size, Got: r.bytesRead}
+		}
+		if attempts == 100 {
+			return 0, io.ErrNoProgress
+		}
 	}
 
 	if err == io.EOF { // Verify content SHA256, if set.
@@ -362,6 +384,14 @@ func (r *Reader) ContentCRC() map[string]string {
 		return map[string]string{r.contentHash.Type.String(): r.trailer.Get(r.contentHash.Type.Key())}
 	}
 	return map[string]string{r.contentHash.Type.String(): r.contentHash.Encoded}
+}
+
+// Checksum returns the content checksum if set.
+func (r *Reader) Checksum() *Checksum {
+	if !r.contentHash.Type.IsSet() || !r.contentHash.Valid() {
+		return nil
+	}
+	return &r.contentHash
 }
 
 var _ io.Closer = (*Reader)(nil) // compiler check
